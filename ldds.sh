@@ -1,30 +1,16 @@
 #!/usr/bin/env bash
-
 # 
 # Hopefully safe re-implementation of ldd.
 # If not safer, it was at least a good exercise.
 # It sure is a lot slower than ldd -- by a few orders of magnitude...
 
-# NOTE:
-#  
-# `arch=get-arch $app` doesn't do what you think it'll do:
-# 1. bash evaluates the assignement `arch=get-arch`
-# 2. bash evaluates $app -> which will be resolved to a named binary in $PATH
-# 3. bash attempts to execute $app
-#
-# `arch=(get-arch $app)` gets evaluated to an array containing two string:
-#  ( 'get-arch' "$app" ) -> "$app" variable will be expanded to its value.
-#
-# what you want is to get the *command substitution* by its value
-
 get-arch() {
     [[ $(file -b $1 | grep -o "64-bit") ]] && echo "64" || echo "32"
 }
 
-app=$1
-arch="$(get-arch $app)"
-
-declare -a -r bdirs=(
+declare -r APP=$1
+declare -r ARCH=$(get-arch $APP)
+declare -r BDIRS=(
     '/lib64'
     '/lib'
     '/bin'
@@ -33,50 +19,57 @@ declare -a -r bdirs=(
     '/usr/bin'
 )
 
+declare -r DPIPE=$(mktemp -u)
+declare -r PPIPE=$(mktemp -u)
+declare -r XTCMD='exit 2' 
+
+declare -a deps
+
 xpand-bdirs() {
     local -a paths
-    for p in ${bdirs[*]}; do
+    for p in ${BDIRS[*]}; do
         paths+=( $p/$1 )
     done
-    echo ${paths[*]}
+    echo "${paths[*]}"
 }
 
-declare fp
-
 found-fullpath() {
-    p=$(readlink -f $1)     # follow simlinks
-    # match the first module that has the same bitness as app
-    return $([[ $(get-arch $p) = $arch ]]; echo $?)
+    [[ -f $1 ]] && {
+        # follow simlinks
+        p=$(readlink -f $1)             
+        # match the first module that has the same bitness as APP
+        [[ $(get-arch $p) = $ARCH ]] && true 
+    } || false
 }
 
 get-fullpath() {
-    fp=$1
+    local fp=$1
     # 1. if we are dealing with a path, we found it!
-    [[ -f $fp ]] && {
-        return 0
-    }
-    local paths=$(xpand-bdirs $1)
-    # 2. check if direct expansion yields paths
-    for p in ${paths[*]}; do
-        [[ -f $p ]] && $(found-fullpath $p) && {
-            fp=$p
-            return 0 
-        }
-    done        
-    # 3. if all else fails, resort to slow `find` calls
     [[ ! -f $fp ]] && {
-        local paths=$(find ${bdirs[@]} -name $1)
+        local paths=$(xpand-bdirs $fp)
+        # 2. check if direct expansion yields paths
         for p in ${paths[*]}; do
-            $(found-fullpath $p) && { 
+            found-fullpath $p && {
                 fp=$p
-                return 0 
+                break
             }
-        done
+        done        
+        # 3. if all else fails, resort to slow `find` calls
+        [[ ! -f $fp ]] && {
+            local paths=$(find ${BDIRS[@]} -name $1)
+            for p in ${paths[*]}; do
+                found-fullpath $p && { 
+                    fp=$p
+                    break
+                }
+            done
+        }
+        [[ ! -f $fp ]] && {
+            echo $XTCMD > $PPIPE
+        }
     }
-    return 2 # file not found
+    echo $fp > $PPIPE
 }
-
-declare -a deps
 
 # NOTE:                                                                                        
 # 
@@ -86,23 +79,53 @@ declare -a deps
 # when the subshell (word)splits the value of 'deps'.
 
 in-dependencies() {
-    return $(IFS=$'\n'; [[ ${deps[*]} =~ $1 ]]; echo $?)
+    $(IFS=$'\n'; [[ "${deps[*]}" =~ $1 ]]) && true || false
 }
 
 list-dependencies() {
-    local od=$(objdump -p $1 | grep -oP '(?<=NEEDED).*' | sed -e 's/\s*//g')
+    local n=0
+    local ndeps=()
+    local od=( $(objdump -p $1 | grep -oP '(?<=NEEDED).*' | sed -e 's/\s*//g') )
     for dep in ${od[*]}; do
-        if ! $(in-dependencies $dep); then  # avoid circular dependencies
-            get-fullpath $dep && {
-                deps+=( $fp )
-                list-dependencies $fp  
+        if ! in-dependencies $dep; then  # avoid circular dependencies
+            # NOTE: this doesn't work because a child/subshell can't write to the parent's memory.
+            #       We, therefore, need some FIFO to allow communication between child and parent.
+            #deps[$i]=$(get-fullpath $dep) & 
+            get-fullpath $dep &
+            ((n++))
+        fi 
+    done
+    if [[ $n -eq 0 ]]; then
+        return
+    fi
+    while [[ $n -gt 0 ]]; do
+        # https://stackoverflow.com/a/4291558
+        # NOTE: This opens and closes the pipe on every iteration:
+        #       `read -r ldeps < $PPIPE`
+        #       which causes certain writers to catch an error when writing.
+        #       Some data is lost.
+        if read -r ldeps; then
+            [[ "$ldeps" =~ "$XTCMD" ]] && {
+                echo "exiting..."
+                $ldeps
             }
+            ndeps+=( ${ldeps[*]} )
+            n=$(($n-${#ldeps[*]}))
         fi
-    done  
+    done < $PPIPE # this keeps the pipe open for writing
+    for dep in ${ndeps[*]}; do
+        deps+=( $dep )
+        list-dependencies $dep
+    done
 }
 
-list-dependencies $app
+mkfifo $DPIPE || exit 1
+mkfifo $PPIPE || exit 1
 
+# Housekeeping... 
+trap 'rm -f $PPIPE; exit' EXIT SIGKILL 
+
+list-dependencies $APP
 # Keep just non-repeated dependency paths.
 deps=( $(IFS=$'\n'; echo "${deps[*]}" | sort -u) )
 
