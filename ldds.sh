@@ -19,16 +19,16 @@ declare -r BDIRS=(
     '/usr/bin'
 )
 
-declare -r DPIPE=$(mktemp -u)
 declare -r PPIPE=$(mktemp -u)
 declare -r XTCMD='exit 2' 
 
 declare -a deps
+declare -i unresolved_deps=0
 
 xpand-bdirs() {
     local -a paths
     for p in ${BDIRS[*]}; do
-        paths+=( $p/$1 )
+        paths+=( "$p/$1" )
     done
     echo "${paths[*]}"
 }
@@ -83,50 +83,42 @@ in-dependencies() {
 }
 
 list-dependencies() {
-    local n=0
     local ndeps=()
     local od=( $(objdump -p $1 | grep -oP '(?<=NEEDED).*' | sed -e 's/\s*//g') )
     for dep in ${od[*]}; do
-        if ! in-dependencies $dep; then  # avoid circular dependencies
-            # NOTE: this doesn't work because a child/subshell can't write to the parent's memory.
-            #       We, therefore, need some FIFO to allow communication between child and parent.
-            #deps[$i]=$(get-fullpath $dep) & 
-            get-fullpath $dep &
-            ((n++))
-        fi 
-    done
-    if [[ $n -eq 0 ]]; then
-        return
-    fi
-    while [[ $n -gt 0 ]]; do
-        # https://stackoverflow.com/a/4291558
-        # NOTE: This opens and closes the pipe on every iteration:
-        #       `read -r ldeps < $PPIPE`
-        #       which causes certain writers to catch an error when writing.
-        #       Some data is lost.
-        if read -r ldeps; then
-            [[ "$ldeps" =~ "$XTCMD" ]] && {
-                echo "exiting..."
-                $ldeps
-            }
-            ndeps+=( ${ldeps[*]} )
-            n=$(($n-${#ldeps[*]}))
-        fi
-    done < $PPIPE # this keeps the pipe open for writing
-    for dep in ${ndeps[*]}; do
-        deps+=( $dep )
-        list-dependencies $dep
+        get-fullpath "$dep" & 
+        ((unresolved_deps++))
     done
 }
 
-mkfifo $DPIPE || exit 1
 mkfifo $PPIPE || exit 1
 
 # Housekeeping... 
 trap 'rm -f $PPIPE; exit' EXIT SIGKILL 
 
-list-dependencies $APP
-# Keep just non-repeated dependency paths.
+list-dependencies "$APP"
+while true ; do
+    if readarray -t ldeps; then
+        for dep in ${ldeps[*]}; do
+            [[ "$dep" =~ "$XTCMD" ]] && {
+                echo "exiting..."
+                $dep
+            } || ! in-dependencies "$dep" && { # avoid circular dependencies
+                deps+=( "$dep" )
+                list-dependencies "$dep "
+            } 
+            ((unresolved_deps--))
+        done
+#printf "#unresolved deps: ${#unresolved_deps[*]}\n"
+        [[ $unresolved_deps -eq 0 ]] && break
+    fi
+done < $PPIPE   # this keeps the pipe open for writing
+                # https://stackoverflow.com/a/4291558
+                # whereas the following opens and closes the pipe on every iteration:
+                #   `read -r ldeps < $PPIPE`
+                # which causes certain writers to catch an error when writing.
+                # Some data is lost.
+
 deps=( $(IFS=$'\n'; echo "${deps[*]}" | sort -u) )
 
 for dep in ${deps[*]}; do
